@@ -119,29 +119,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index <= rf.lastSnapshotIndex {
 		return
 	}
-	// 1) compute term of entry being snapshotted
+	// compute term at that index
 	logIndex := index - rf.lastSnapshotIndex
 	lastTerm := rf.log[logIndex].Term
 
-	// 2) truncate log with dummy at [0]
+	// truncate log, leaving a dummy at position 0
 	newLog := make([]LogEntry, 1, len(rf.log)-logIndex+1)
 	newLog[0] = LogEntry{Term: lastTerm}
 	newLog = append(newLog, rf.log[logIndex+1:]...)
 	rf.log = newLog
 
-	// 3) advance snapshot metadata
+	// advance snapshot pointers
 	rf.lastSnapshotIndex = index
 	rf.lastSnapshotTerm = lastTerm
 
-	// 4) advance commitIndex & lastApplied so we don't re‑apply
-	if rf.commitIndex < index {
-		rf.commitIndex = index
-	}
-	if rf.lastApplied < index {
-		rf.lastApplied = index
-	}
-
-	// 5) fix nextIndex/matchIndex for all peers
+	// **critical**: adjust nextIndex & matchIndex so they never point into the discarded prefix
 	for i := range rf.peers {
 		if rf.nextIndex[i] < index+1 {
 			rf.nextIndex[i] = index + 1
@@ -151,7 +143,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		}
 	}
 
-	// 6) persist Raft state + snapshot atomically
+	// persist Raft state and the snapshot atomically
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -159,18 +151,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	e.Encode(rf.lastSnapshotIndex)
 	e.Encode(rf.lastSnapshotTerm)
 	e.Encode(rf.log)
-	state := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(state, snapshot)
-
-	// 7) if leader, immediately replicate so followers install snapshot
+	raftState := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(raftState, snapshot)
+	// If I'm the leader, let followers know about the new snapshot immediately
 	if rf.state == Leader {
-		for srv := range rf.peers {
-			if srv == rf.me {
+		for server := range rf.peers {
+			if server == rf.me {
 				continue
 			}
-			go rf.replicateLogToPeer(srv)
+			go rf.replicateLogToPeer(server)
 		}
 	}
+
 }
 
 // GetState returns currentTerm and isLeader
@@ -369,7 +361,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term < rf.currentTerm {
 		return
 	}
-	// 1) Step down on new term
+	// 1) Step down if needed
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -378,30 +370,25 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.state = Follower
 	rf.electionReset = time.Now()
 
-	// 2) If this snapshot is newer, install it
+	// 2) If the snapshot is newer than what we have, install
 	if args.LastIncludedIndex > rf.lastSnapshotIndex {
-		oldSnapIndex := rf.lastSnapshotIndex
-
-		// update snapshot metadata
 		rf.lastSnapshotIndex = args.LastIncludedIndex
 		rf.lastSnapshotTerm = args.LastIncludedTerm
 
-		// discard log prefix up through LastIncludedIndex
+		// discard any log prefix up through LastIncludedIndex
+		// keep only entries after that
 		newLog := make([]LogEntry, 0)
+		// if we had entries beyond
 		for i, entry := range rf.log {
-			globalIdx := oldSnapIndex + i
+			globalIdx := rf.lastSnapshotIndex + i
 			if globalIdx > args.LastIncludedIndex {
 				newLog = append(newLog, entry)
 			}
 		}
-		// prepend dummy for the snapshot position
-		rf.log = append([]LogEntry{{Term: args.LastIncludedTerm}}, newLog...)
 
-		// **CRITICAL**: advance both commitIndex and lastApplied
-		rf.commitIndex = args.LastIncludedIndex
-		rf.lastApplied = args.LastIncludedIndex
+		rf.log = newLog
 
-		// persist state+snapshot
+		// 3) Persist state+snapshot
 		w := new(bytes.Buffer)
 		e := labgob.NewEncoder(w)
 		e.Encode(rf.currentTerm)
@@ -409,17 +396,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		e.Encode(rf.lastSnapshotIndex)
 		e.Encode(rf.lastSnapshotTerm)
 		e.Encode(rf.log)
-		state := w.Bytes()
-		rf.persister.SaveStateAndSnapshot(state, args.Data)
+		data := w.Bytes()
+		rf.persister.SaveStateAndSnapshot(data, args.Data)
 
-		// 3) deliver the snapshot to the service
-		rf.mu.Unlock()
-		rf.applyCh <- raftapi.ApplyMsg{
+		// 4) Send snapshot up the pipe
+		applyMsg := raftapi.ApplyMsg{
 			SnapshotValid: true,
 			Snapshot:      args.Data,
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
+		rf.mu.Unlock() // unlock before send
+		rf.applyCh <- applyMsg
 		rf.mu.Lock()
 	}
 }
@@ -561,23 +549,43 @@ func (rf *Raft) replicateLogToPeer(server int) {
 }
 
 // applyEntries sends committed logs to applyCh
+// applyEntries sends committed log entries to applyCh in order,
+// translating global (persisted) indexes into our in‐memory slice,
+// and skipping any entries that have been removed by a snapshot.
 func (rf *Raft) applyEntries() {
 	rf.mu.Lock()
-	for rf.lastApplied+1 <= rf.commitIndex && rf.lastApplied+1 < len(rf.log) {
-		rf.lastApplied++
-		entry := rf.log[rf.lastApplied]
-		rf.mu.Unlock()
+	defer rf.mu.Unlock()
 
+	// Keep applying as long as there's something new to apply
+	for rf.lastApplied < rf.commitIndex {
+		nextIndex := rf.lastApplied + 1
+
+		// If the next entry is already part of a snapshot, skip it
+		if nextIndex <= rf.lastSnapshotIndex {
+			rf.lastApplied = nextIndex
+			continue
+		}
+
+		// Map the global index into our rf.log slice
+		sliceIdx := nextIndex - rf.lastSnapshotIndex
+		if sliceIdx <= 0 || sliceIdx >= len(rf.log) {
+			// We don't have it yet (maybe waiting on AppendEntries),
+			// so stop applying for now.
+			break
+		}
+
+		entry := rf.log[sliceIdx]
+		rf.lastApplied = nextIndex
+
+		// Deliver without holding the lock
+		rf.mu.Unlock()
 		rf.applyCh <- raftapi.ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
-			CommandIndex: rf.lastApplied,
+			CommandIndex: nextIndex,
 		}
-
 		rf.mu.Lock()
 	}
-
-	rf.mu.Unlock()
 }
 
 // ticker runs election timeout checks
@@ -697,16 +705,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *tester.Persister, applyC
 		rf.matchIndex[i] = 0
 	}
 	rf.readPersist(rf.persister.ReadRaftState())
-	// If there’s a snapshot on disk, send it up to the service now
-	snapshot := rf.persister.ReadSnapshot()
-	if snapshot != nil && len(snapshot) > 0 {
-		rf.applyCh <- raftapi.ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      snapshot,
-			SnapshotTerm:  rf.lastSnapshotTerm,
-			SnapshotIndex: rf.lastSnapshotIndex,
-		}
-	}
 
 	// start the election ticker
 	go rf.ticker()
@@ -720,8 +718,6 @@ func (rf *Raft) persist() {
 	// encode the three persistent fields:
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.lastSnapshotIndex)
-	e.Encode(rf.lastSnapshotTerm)
 	e.Encode(rf.log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -730,23 +726,21 @@ func (rf *Raft) persist() {
 // restore previously persisted state
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 {
+		// nothing to restore
 		return
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var term, votedFor, lastSnapIndex, lastSnapTerm int
+	var currentTerm int
+	var votedFor int
 	var log []LogEntry
-	if d.Decode(&term) != nil ||
+	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&lastSnapIndex) != nil ||
-		d.Decode(&lastSnapTerm) != nil ||
 		d.Decode(&log) != nil {
-		// ignore decode errors
+		// decode error—ignore for now
 	} else {
-		rf.currentTerm = term
+		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		rf.lastSnapshotIndex = lastSnapIndex
-		rf.lastSnapshotTerm = lastSnapTerm
 		rf.log = log
 	}
 }
